@@ -12,11 +12,11 @@ from torch_geometric.data import Data
 
 
 def load_wikiweb2m(task):
-    train_df = pd.read_parquet(f'./wikiweb2m/raw/wikiweb2m_train_large.parquet')
-    val_df = pd.read_parquet(f'./wikiweb2m/raw/wikiweb2m_val_large.parquet')
-    test_df = pd.read_parquet(f'./wikiweb2m/raw/wikiweb2m_test_large.parquet')
+    train_df = pd.read_parquet(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/wikiweb2m_train_large_mini.parquet')
+    val_df = pd.read_parquet(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/wikiweb2m_val_large_mini.parquet')
+    test_df = pd.read_parquet(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/wikiweb2m_test_large_mini.parquet')
 
-    with open(f'./wikiweb2m/raw/{task}_id_split_large.pkl', 'rb') as f:
+    with open(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/section_id_split_large_mini.pkl', 'rb') as f:
         id_list = pickle.load(f)
 
     return train_df, val_df, test_df, id_list
@@ -25,8 +25,8 @@ def load_wikiweb2m(task):
 class WikiWeb2M(torch.utils.data.Dataset):
 
     def __init__(self, args, df, id_list, tokenizer):
-        self.path = './wikiweb2m/raw/'
-        self.image_path = f'{args.image_path}/images/'
+        self.path = '/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/'
+        self.image_path = f'{self.path}/images_mini/'
         if not os.path.exists(self.image_path) and args.context in ('section_all', 'all'):
             raise ValueError(f'{self.image_path} does not exist')
 
@@ -404,5 +404,3 @@ def collate(items):
             "labels": torch.stack(labels, dim=0),
             "image_positions": torch.stack(image_positions, dim=0),
             }
-
-

@@ -62,11 +62,18 @@ from transformers.optimization import Adafactor
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+import sys
+import os
+
+sys.path.append('/home/xuyingn2/MMGL/research-MMHG')
+
 from wikiweb2m import load_wikiweb2m, WikiWeb2M
 from wikiweb2m.cider import Cider
 
 from language_modelling import utils
 from model import SelfAttentionModel, CrossAttentionModel
+from torch.utils.data import Subset
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.17.0")
@@ -98,10 +105,10 @@ class Arguments:
         default='section_summarization', metadata={"help": "The domain of OAG datasets"}
     )
     context: Optional[str] = field(
-        default='section_only', metadata={"help": "The domain of OAG datasets"}
+        default='all', metadata={"help": "The domain of OAG datasets"}
     )
     max_input_length: Optional[int] = field(
-        default=512, metadata={"help": "maximum token length of input text"}
+        default=1024, metadata={"help": "maximum token length of input text"}
     )
     max_output_length: Optional[int] = field(
         default=128, metadata={"help": "maximum token length of output text"}
@@ -192,7 +199,7 @@ class Arguments:
     )
 
     model_name_or_path: str = field(
-        default=None, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+        default='facebook/opt-125m', metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     decoder_only: Optional[bool] = field(
         default=False, metadata={"help": "opt or mpt"}
@@ -219,7 +226,7 @@ class Arguments:
         default=False, metadata={"help": "evaluate model on validation set."}
     )
     neighbor_mode: str = field(
-        default="raw", metadata={"help": "position id type for text neighbors"}
+        default="prefix", metadata={"help": "position id type for text neighbors"}
     )
     max_text_neighbors: int = field(
         default=11, metadata={"help": "maximum number of text neighbors"}
@@ -235,7 +242,7 @@ class Arguments:
         default=1, metadata={"help": "number of cross-attention layers for neighbor information"}
     )
     peft_type: str = field(
-        default="none", metadata={"help": "lora type for cross attention"}
+        default="prefix", metadata={"help": "lora type for cross attention"}
     )
     lora_r: int = field(
         default=64, metadata={"help": "lora row rank"}
@@ -285,7 +292,7 @@ def main():
 def main_worker(gpu, world_size, args, log_dir, run):
     global best_acc1
     print("Use GPU: {} for training".format(gpu))
-    dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:1337', world_size=world_size, rank=gpu)
+    dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:1345', world_size=world_size, rank=gpu)
 
     # Prepare pretrained model
     if "t5" in args.model_name_or_path:
@@ -361,6 +368,7 @@ def main_worker(gpu, world_size, args, log_dir, run):
     train_dataset = WikiWeb2M(args, train_data, id_list["train"], tokenizer)
     val_dataset = WikiWeb2M(args, val_data, id_list["val"], tokenizer)
     test_dataset = WikiWeb2M(args, test_data, id_list["test"], tokenizer)
+    
     print(f'Initialize datasets: {perf_counter()-start_time}')
     print(f'Training with {len(train_dataset)} examples, validating with {len(val_dataset)} examples, testing with {len(test_dataset)} examples.')
 
@@ -432,7 +440,7 @@ def train_loop(train_loader, model, tokenizer, optimizer, epoch, scheduler, args
     data_time = utils.AverageMeter('Data', ':6.3f')
     forward_time = utils.AverageMeter('Forward', ':6.3f')
     losses = utils.AverageMeter('Loss', ':.4e')
-
+   
     if gpu % world_size == 0:
         progress = utils.ProgressMeter(args.steps_per_epoch, [batch_time, losses], prefix="Epoch: [{}]".format(epoch))
 
@@ -454,6 +462,7 @@ def train_loop(train_loader, model, tokenizer, optimizer, epoch, scheduler, args
         loss = outputs.loss
         if args.decoder_only:
             logits = outputs.logits
+            
             # only consider loss on reference summary just like seq2seq models
             if args.peft_type == "prompt":
                 max_input_length = args.max_input_length + args.n_virtual_tokens
@@ -535,7 +544,7 @@ def evaluate_loop(val_loader, model, tokenizer, epoch, args, run, prefix="val"):
 
     if args.decoder_only:
         loss_fct = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-
+    
     # switch to evaluate mode
     model.eval()
     with torch.no_grad():
@@ -558,6 +567,7 @@ def evaluate_loop(val_loader, model, tokenizer, epoch, args, run, prefix="val"):
                 else:
                     max_input_length = args.max_input_length
                 logits = logits[..., max_input_length:-1, :].contiguous()
+
                 labels = batch['labels'][..., (args.max_input_length + 1):].contiguous()
                 loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
             else:
@@ -573,6 +583,7 @@ def evaluate_loop(val_loader, model, tokenizer, epoch, args, run, prefix="val"):
                     generated_ids = model.module.generate(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], max_new_tokens=32)
             else:
                 generated_ids = torch.argmax(logits, dim=-1)
+
             all_generated_ids = [torch.zeros_like(generated_ids) for _ in range(dist.get_world_size())]
             dist.all_gather(all_generated_ids, generated_ids)
             all_generated_ids[dist.get_rank()] = generated_ids
@@ -583,6 +594,7 @@ def evaluate_loop(val_loader, model, tokenizer, epoch, args, run, prefix="val"):
             dist.all_gather(all_tgt_tokens, tgt_tokens)
             all_tgt_tokens[dist.get_rank()] = tgt_tokens
             all_tgt_tokens = torch.cat(all_tgt_tokens)
+            
 
             if not args.decoder_only:
                 all_tgt_tokens[all_tgt_tokens == -100] = tokenizer.pad_token_id

@@ -34,86 +34,6 @@ class TextPooler(nn.Module):
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
-class QFormer(nn.Module):
-    def __init__(self, hidden_dim, num_heads, num_layers, num_queries, dropout=0.1):
-        super().__init__()
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self.num_queries = num_queries
-
-        # Learned Queries
-        self.learned_queries = nn.Parameter(torch.randn(num_queries, hidden_dim))
-
-        # Transformer Layers: Self-Attention, Cross-Attention, Feed-Forward
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                "self_attn": nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True),
-                "cross_attn": nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True),
-                "feed_forward": nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim * 4),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim * 4, hidden_dim),
-                    nn.Dropout(dropout),
-                ),
-                "norm1": nn.LayerNorm(hidden_dim),
-                "norm2": nn.LayerNorm(hidden_dim),
-                "norm3": nn.LayerNorm(hidden_dim),
-            })
-            for _ in range(num_layers)
-        ])
-
-    def forward(self, visual_embs, text_embs):
-        """
-        Args:
-            visual_embs: (B, visual_neighbor_num, D) - Visual embeddings from image encoder
-            text_embs: (B, seq_len, D) - Text embeddings from text encoder
-        
-        Returns:
-            output_embs: (B, num_queries, D) - Learned queries after interaction
-        """
-        batch_size, visual_neighbor_num, hidden_dim = visual_embs.shape
-        assert hidden_dim == self.hidden_dim, "Hidden dimension mismatch!"
-
-        # Initialize queries
-        queries = self.learned_queries.unsqueeze(0).repeat(batch_size, 1, 1)  # (B, num_queries, D)
-
-        for layer in self.layers:
-            # Step 1: Query Self-Attention
-            queries_norm = layer["norm1"](queries)
-            queries_attn, _ = layer["self_attn"](queries_norm, queries_norm, queries_norm)  # (B, num_queries, D)
-            queries = queries + queries_attn  # Residual connection
-
-            # Step 2: Cross Attention with Visual Embeddings
-            queries_norm = layer["norm2"](queries)
-            cross_attn_output, _ = layer["cross_attn"](queries_norm, visual_embs, visual_embs)  # (B, num_queries, D)
-            queries = queries + cross_attn_output  # Residual connection
-
-            # Step 3: Feed-Forward Network
-            queries_norm = layer["norm3"](queries)
-            ff_output = layer["feed_forward"](queries_norm)  # (B, num_queries, D)
-            queries = queries + ff_output  # Residual connection
-
-        return queries  # (B, num_queries, D)
-
-
-# Example of integrating QFormer in the get_visual_embs function
-def get_visual_embs(self, input_ids, attention_mask, pixel_values):
-    # Text encoder for input IDs
-    text_outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-    text_embs = text_outputs.hidden_states[-1]  # (B, seq_len, D)
-
-    # Visual encoder for pixel values
-    batch_size, visual_neighbor_num, pixel, width, height = pixel_values.shape
-    pixel_values = pixel_values.reshape(-1, pixel, width, height)  # (B * visual_neighbor_num, pixel, H, W)
-    visual_outputs = self.visual_model(pixel_values)
-    visual_encoder_outputs = visual_outputs.pooler_output  # (B * visual_neighbor_num, D)
-    visual_embs = visual_encoder_outputs.reshape(batch_size, visual_neighbor_num, -1)  # (B, visual_neighbor_num, D)
-
-    # Apply QFormer for learned queries and cross-modal fusion
-    visual_embs = self.q_former(visual_embs, text_embs)  # (B, num_queries, D)
-
-    return visual_embs
-
 
 class SelfAttentionModel(nn.Module):
     def __init__(self, args, tokenizer):
@@ -175,8 +95,7 @@ class SelfAttentionModel(nn.Module):
         if self.neighbor_mode == "prefix":
             # Text model processing text neighbors
             embedding_dim = self.input_embeddings.embedding_dim * args.n_text_tokens
-            # self.text_model = CLIPTextModel.from_pretrained(args.text_model)
-            self.text_model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config)
+            self.text_model = CLIPTextModel.from_pretrained(args.text_model)
             self.text_embeddings = nn.Linear(self.text_model.config.hidden_size, embedding_dim)
             if self.position_type == "none":
                 self.text_position_embeddings = nn.Embedding(args.max_output_length + 1, embedding_dim) # + 1 for padding neighbors
@@ -184,41 +103,16 @@ class SelfAttentionModel(nn.Module):
             self.text_model.eval()
             for name, param in self.text_model.named_parameters():
                 param.requires_grad = False
-        
 
         self.visual_model = None
         if self.context in ("section_all", "all"):
-            embedding_dim = self.input_embeddings.embedding_dim * args.n_text_tokens
-            self.text_model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config)
-            self.text_embeddings = nn.Linear(self.text_model.config.hidden_size, embedding_dim)
-            if self.position_type == "none":
-                self.text_position_embeddings = nn.Embedding(args.max_output_length + 1, embedding_dim) # + 1 for padding neighbors
-
-            self.text_model.eval()
-            for name, param in self.text_model.named_parameters():
-                param.requires_grad = False
-
             # Vision model processing image neighbors
-            self.n_heads = 8
-            self.n_layers = 12
-            self.mhasat = nn.Transformer(
-                            d_model= self.text_model.config.hidden_size,
-                            nhead=self.n_heads,
-                            num_encoder_layers=self.n_layers,
-                            num_decoder_layers=0, #self.n_layers
-                            dim_feedforward=self.text_model.config.hidden_size * 4, #256 * 4
-                            dropout=0.1,
-                        )
-            self.text_cross_attention = nn.MultiheadAttention(embed_dim= self.text_model.config.hidden_size, num_heads= self.n_heads)
-            self.visual_cross_attention = nn.MultiheadAttention(embed_dim= self.text_model.config.hidden_size, num_heads= self.n_heads)
-                
             embedding_dim = self.input_embeddings.embedding_dim * args.n_visual_tokens
             self.visual_model = CLIPVisionModel.from_pretrained(args.visual_model)
             self.visual_embeddings = nn.Linear(self.visual_model.config.hidden_size, embedding_dim)
-            
             if self.position_type == "none":
                 self.visual_position_embeddings = nn.Embedding(args.max_output_length + 1, embedding_dim) # + 1 for padding neighbors
-                
+
             self.visual_model.eval()
             for param in self.visual_model.parameters():
                 param.requires_grad = False
@@ -259,77 +153,19 @@ class SelfAttentionModel(nn.Module):
         text_embs = text_embs.reshape(text_embs.shape[0], self.n_text_tokens, -1)
         return text_embs.reshape(batch_size, neighbor_num, self.n_text_tokens, -1)
 
+    def get_visual_embs(self, pixel_values, pos_ids=None):
+        batch_size, neighbor_num, pixel, width, height = pixel_values.shape
+        pixel_values = pixel_values.reshape(-1, pixel, width, height)
+        outputs = self.visual_model(pixel_values)
+        encoder_outputs = outputs.pooler_output
+        visual_embs = self.visual_embeddings(encoder_outputs)
 
-    # def get_visual_embs(self, input_ids, attention_mask, pixel_values):
-    #     batch_size, text_neighbor_num, seq_len = neighbor_input_ids.shape
-    #     neighbor_input_ids = neighbor_input_ids.reshape(-1, seq_len)
-    #     neighbor_attention_mask = neighbor_attention_mask.reshape(-1, seq_len)
-    #     neighbor_outputs = self.text_model(input_ids=neighbor_input_ids, attention_mask=neighbor_attention_mask, output_hidden_states=True)
-    #     neighbor_encoder_outputs = neighbor_outputs.hidden_states[-1]  # (B * text_neighbor_num, seq_len, D)
-    #     neighbor_encoder_outputs = neighbor_encoder_outputs.mean(dim=1)  # (B * text_neighbor_num, D)
-    #     neighbor_embs = neighbor_encoder_outputs.reshape(batch_size, text_neighbor_num, -1)  # (B, text_neighbor_num, D)
+        if self.position_type == "none" and pos_ids is not None:
+            pos_ids = pos_ids.reshape(-1)
+            visual_embs = visual_embs + self.visual_position_embeddings(pos_ids)
 
-    #     batch_size, visual_neighbor_num, pixel, width, height = pixel_values.shape
-    #     pixel_values = pixel_values.reshape(-1, pixel, width, height)
-    #     visual_outputs = self.visual_model(pixel_values)
-    #     encoder_outputs = visual_outputs.pooler_output  # (B * visual_neighbor_num, D)
-    #     visual_embs = encoder_outputs.reshape(batch_size, visual_neighbor_num, -1)  # (B, visual_neighbor_num, D)
-
-    #     # Align text neighbors to visual neighbors
-    #     if text_neighbor_num < visual_neighbor_num:
-    #         repeats = (visual_neighbor_num + text_neighbor_num - 1) // text_neighbor_num
-    #         neighbor_embs = neighbor_embs.repeat_interleave(repeats, dim=1)[:, :visual_neighbor_num, :]
-    #     elif text_neighbor_num > visual_neighbor_num:
-    #         neighbor_embs = neighbor_embs[:, :visual_neighbor_num, :]
-
-    #     neighbor_embs = neighbor_embs.transpose(0, 1)  # (visual_neighbor_num, B, D)
-    #     H_text = self.mhasat(src=neighbor_embs, tgt=neighbor_embs)  # (visual_neighbor_num, B, D)
-
-    #     visual_embs = visual_embs.transpose(0, 1)  # (visual_neighbor_num, B, D)
-    #     H_final = self.visual_cross_attention(
-    #         query=H_text,
-    #         key=visual_embs,
-    #         value=visual_embs
-    #     )[0]  # (visual_neighbor_num, B, D)
-
-    #     H_final = H_final.transpose(0, 1)  # (B, visual_neighbor_num, D)
-    #     visual_embs = self.visual_embeddings(H_final)  # (B, visual_neighbor_num, embedding_dim)
-
-    #     return visual_embs.reshape(batch_size, visual_neighbor_num, self.n_visual_tokens, -1)
-
-    def get_visual_embs(self, input_ids, attention_mask, pixel_values):
-        # Self Attention on input_ids
-        batch_size, seq_len = input_ids.shape
-        text_outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        text_encoder_outputs = text_outputs.hidden_states[-1]  # (B, seq_len, D)
-        text_embs = text_encoder_outputs.mean(dim=1)  # (B, D)
-
-        # Process visual neighbors
-        batch_size, visual_neighbor_num, pixel, width, height = pixel_values.shape
-        pixel_values = pixel_values.reshape(-1, pixel, width, height)  # (B * visual_neighbor_num, pixel, H, W)
-        visual_outputs = self.visual_model(pixel_values)
-        visual_encoder_outputs = visual_outputs.pooler_output  # (B * visual_neighbor_num, D)
-        visual_embs = visual_encoder_outputs.reshape(batch_size, visual_neighbor_num, -1)  # (B, visual_neighbor_num, D)
-
-        # Replicate text_embs to match visual_neighbor_num
-        text_embs = text_embs.unsqueeze(1).repeat(1, visual_neighbor_num, 1)  # (B, visual_neighbor_num, D)
-        text_embs = text_embs.transpose(0, 1)  # (visual_neighbor_num, B, D)
-
-        # Cross Attention: input_ids (text) as query, visual_embs as key/value
-        visual_embs = visual_embs.transpose(0, 1)  # (visual_neighbor_num, B, D)
-        H_final = self.visual_cross_attention(
-            query=text_embs,  # (visual_neighbor_num, B, D)
-            key=visual_embs,  # (visual_neighbor_num, B, D)
-            value=visual_embs  # (visual_neighbor_num, B, D)
-        )[0]  # (visual_neighbor_num, B, D)
-
-        # Transpose back and reshape
-        H_final = H_final.transpose(0, 1)  # (B, visual_neighbor_num, D)
-        visual_embs = self.visual_embeddings(H_final)  # (B, visual_neighbor_num, embedding_dim)
-
-        # Return reshaped embeddings
-        return visual_embs.reshape(batch_size, visual_neighbor_num, self.n_visual_tokens, -1)
-
+        visual_embs = visual_embs.reshape(visual_embs.shape[0], self.n_visual_tokens, -1)
+        return visual_embs.reshape(batch_size, neighbor_num, self.n_visual_tokens, -1)
 
     def train(self, mode=True):
         super(SelfAttentionModel, self).train(mode=mode)
@@ -363,7 +199,7 @@ class SelfAttentionModel(nn.Module):
 
         elif self.neighbor_mode == "raw" and self.context in ("section_all", "all"):
             input_embs = self.input_embeddings(input_ids)
-            visual_embs = self.get_visual_embs(input_ids, attention_mask, images) #input_ids, attention_mask, pixel_values, neighbor_input_ids, neighbor_attention_mask, pos_ids=None
+            visual_embs = self.get_visual_embs(images)
 
             batch_size, seq_len, hidden_dim = input_embs.shape
             if self.context == "section_all":
@@ -437,14 +273,14 @@ class SelfAttentionModel(nn.Module):
                     gnn_embeds = self.gnn(neighbor_embeds, graph)
                     neighbor_embeds = neighbor_embeds + gnn_embeds
                     neighbor_embeds = neighbor_embeds.view(batch_size, total_neighbor_num, n_tokens, hidden_dim).view(batch_size, -1, hidden_dim)
-                             
+                    
+                    
             input_embs[:, neighbor_start:neighbor_end] = neighbor_embeds
             attention_mask[:, neighbor_start:neighbor_end] = neighbor_attention_mask
 
             if self.decoder_only:
                 labels[:, neighbor_start:neighbor_end] = -100
             return self.lm(inputs_embeds=input_embs, attention_mask=attention_mask, labels=labels)
-            
 
         else:
             raise ValueError(f"Neighbor mode: {self.neighbor_mode} and context: {self.context} are not supported.")

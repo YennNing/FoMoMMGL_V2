@@ -72,6 +72,86 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
+class QFormer(nn.Module):
+    def __init__(self, hidden_dim, num_heads, num_layers, num_queries, dropout=0.1):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.num_queries = num_queries
+
+        # Learned Queries
+        self.learned_queries = nn.Parameter(torch.randn(num_queries, hidden_dim))
+
+        # Transformer Layers: Self-Attention, Cross-Attention, Feed-Forward
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                "self_attn": nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True),
+                "cross_attn": nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True),
+                "feed_forward": nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 4),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim * 4, hidden_dim),
+                    nn.Dropout(dropout),
+                ),
+                "norm1": nn.LayerNorm(hidden_dim),
+                "norm2": nn.LayerNorm(hidden_dim),
+                "norm3": nn.LayerNorm(hidden_dim),
+            })
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, visual_embs, text_embs):
+        """
+        Args:
+            visual_embs: (B, visual_neighbor_num, D) - Visual embeddings from image encoder
+            text_embs: (B, seq_len, D) - Text embeddings from text encoder
+        
+        Returns:
+            output_embs: (B, num_queries, D) - Learned queries after interaction
+        """
+        batch_size, visual_neighbor_num, hidden_dim = visual_embs.shape
+        assert hidden_dim == self.hidden_dim, "Hidden dimension mismatch!"
+
+        # Initialize queries
+        queries = self.learned_queries.unsqueeze(0).repeat(batch_size, 1, 1)  # (B, num_queries, D)
+
+        for layer in self.layers:
+            # Step 1: Query Self-Attention
+            queries_norm = layer["norm1"](queries)
+            queries_attn, _ = layer["self_attn"](queries_norm, queries_norm, queries_norm)  # (B, num_queries, D)
+            queries = queries + queries_attn  # Residual connection
+
+            # Step 2: Cross Attention with Visual Embeddings
+            queries_norm = layer["norm2"](queries)
+            cross_attn_output, _ = layer["cross_attn"](queries_norm, visual_embs, visual_embs)  # (B, num_queries, D)
+            queries = queries + cross_attn_output  # Residual connection
+
+            # Step 3: Feed-Forward Network
+            queries_norm = layer["norm3"](queries)
+            ff_output = layer["feed_forward"](queries_norm)  # (B, num_queries, D)
+            queries = queries + ff_output  # Residual connection
+
+        return queries  # (B, num_queries, D)
+
+
+# Example of integrating QFormer in the get_visual_embs function
+def get_visual_embs(self, input_ids, attention_mask, pixel_values):
+    # Text encoder for input IDs
+    text_outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+    text_embs = text_outputs.hidden_states[-1]  # (B, seq_len, D)
+
+    # Visual encoder for pixel values
+    batch_size, visual_neighbor_num, pixel, width, height = pixel_values.shape
+    pixel_values = pixel_values.reshape(-1, pixel, width, height)  # (B * visual_neighbor_num, pixel, H, W)
+    visual_outputs = self.visual_model(pixel_values)
+    visual_encoder_outputs = visual_outputs.pooler_output  # (B * visual_neighbor_num, D)
+    visual_embs = visual_encoder_outputs.reshape(batch_size, visual_neighbor_num, -1)  # (B, visual_neighbor_num, D)
+
+    # Apply QFormer for learned queries and cross-modal fusion
+    visual_embs = self.q_former(visual_embs, text_embs)  # (B, num_queries, D)
+
+    return visual_embs
+
 
 class MPTConfig(PretrainedConfig):
 

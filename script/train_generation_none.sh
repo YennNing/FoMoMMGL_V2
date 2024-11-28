@@ -10,7 +10,7 @@ export PYTHONPATH=.
 #MODEL_NAME='facebook/opt-350m'
 MODEL_NAME='facebook/opt-125m'
 TASK='section_all'
-CONTEXT='all'
+CONTEXT='section_all'
 DESCRIPTION=${MODEL_NAME}-${TASK}-${CONTEXT}
 
 CUDA_VISIBLE_DEVICES=3,5 python language_modelling/run_generation.py \
@@ -21,7 +21,7 @@ CUDA_VISIBLE_DEVICES=3,5 python language_modelling/run_generation.py \
     --context ${CONTEXT} \
     --peft_type prefix \
     --position_type none \
-    --max_input_length 1024 \
+    --max_input_length 512 \
     --max_output_length 128 \
     --epochs 50 \
     --steps_per_epoch 10000 \

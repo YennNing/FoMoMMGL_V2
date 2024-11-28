@@ -1,7 +1,5 @@
-*.parquet
-*.pkl
-*.txt
-*.json
-*.tsv
-*.zip
-*.pk
+wikiweb2m/raw
+*.out
+*.log
+wandb
+log
