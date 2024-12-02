@@ -12,11 +12,11 @@ from torch_geometric.data import Data
 
 
 def load_wikiweb2m(task):
-    train_df = pd.read_parquet(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/wikiweb2m_train_large_mini.parquet')
-    val_df = pd.read_parquet(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/wikiweb2m_val_large_mini.parquet')
-    test_df = pd.read_parquet(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/wikiweb2m_test_large_mini.parquet')
+    train_df = pd.read_parquet(f'./wikiweb2m/raw/wikiweb2m_train_large_mini.parquet')
+    val_df = pd.read_parquet(f'./wikiweb2m/raw/wikiweb2m_val_large_mini.parquet')
+    test_df = pd.read_parquet(f'./wikiweb2m/raw/wikiweb2m_test_large_mini.parquet')
 
-    with open(f'/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/section_id_split_large_mini.pkl', 'rb') as f:
+    with open(f'./wikiweb2m/raw/section_id_split_large_mini.pkl', 'rb') as f:
         id_list = pickle.load(f)
 
     return train_df, val_df, test_df, id_list
@@ -25,7 +25,7 @@ def load_wikiweb2m(task):
 class WikiWeb2M(torch.utils.data.Dataset):
 
     def __init__(self, args, df, id_list, tokenizer):
-        self.path = '/home/xuyingn2/MMGL/research-MMHG/wikiweb2m/raw/'
+        self.path = './wikiweb2m/raw/'
         self.image_path = f'{self.path}/images_mini/'
         if not os.path.exists(self.image_path) and args.context in ('section_all', 'all'):
             raise ValueError(f'{self.image_path} does not exist')
@@ -44,6 +44,9 @@ class WikiWeb2M(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.max_input_length = args.max_input_length
         self.max_output_length = args.max_output_length
+        self.text_model = args.text_model
+        self.text_tokenizer = AutoTokenizer.from_pretrained(args.text_model, use_fast=False)
+        self.text_tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
 
         if self.neighbor_mode in ('prefix', 'cross_attention'):
             self.text_model = args.text_model
@@ -143,14 +146,14 @@ class WikiWeb2M(torch.utils.data.Dataset):
             context_info = ', '.join(context_info)
             inputs = "summarize: " + section_info + ", context: " + page_info + context_info
             input_ids = self.tokenizer(inputs, max_length=self.max_input_length, padding="do_not_pad", truncation=True, return_tensors="pt").input_ids[0]
-
-        elif self.context == "all":
+        
+        elif self.context == "all": #graph token will be added here
             page_info = self.get_page_info(d)
             section_info, labels = self.get_section_info(section_id, d, remove_summary=True)
             section_image, section_caption = self.get_section_images(page_id, section_id, d)
-
             images = []
             image_positions = []
+             
             if section_image is None:
                 inputs = "summarize: " + section_info
                 visual_ids = torch.LongTensor(self.n_visual_tokens * [self.tokenizer.pad_token_id])
@@ -159,8 +162,13 @@ class WikiWeb2M(torch.utils.data.Dataset):
                 inputs = "summarize: " + section_info + ", context: " + section_caption
                 visual_ids = torch.LongTensor(self.n_visual_tokens * [100])
                 images.append(section_image)
-            max_text_length = self.max_input_length - self.n_visual_tokens
+            
+            max_text_length = self.max_input_length - self.n_visual_tokens - 1 #-1 for graph token
             input_ids = self.tokenizer(inputs, max_length=max_text_length, padding="do_not_pad", truncation=True, return_tensors="pt").input_ids[0]
+            # Add graph token at the beginning
+            graph_token = torch.LongTensor([100])
+            input_ids = torch.cat([graph_token, input_ids], dim=0)
+            #add image
             image_positions.append(input_ids.shape[0] + torch.arange(self.n_visual_tokens))
             input_ids = torch.cat([input_ids, visual_ids], dim=0)
 
@@ -221,6 +229,113 @@ class WikiWeb2M(torch.utils.data.Dataset):
             result["images"] = images
             result["image_positions"] = image_positions
 
+        if self.context == "all":
+            # Multimodal neighbor information
+            neighbor_texts = []
+            neighbor_images = []
+            position_texts = []
+            position_images = []
+            location_texts = []
+            location_images = []
+            location = 0
+            # Graph
+            graph_index = {section_id: 0} # input text: 0, neighbors: location + 1
+            edge_list = []
+            
+            #(input node itself)
+            neighbor_texts.append(section_info)
+            position_texts.append(len(position_texts))
+            location_texts.append(location)
+            location += 1
+            
+            #(1) page information
+            page_info = self.get_page_info(d)
+            neighbor_texts.append(page_info)
+            position_texts.append(len(position_texts))
+            location_texts.append(location)
+            location += 1
+            # Graph: input_text <-> page description
+            edge_list.append((graph_index[section_id], location))
+
+            #(2) session image information
+            if self.context != "text_only":
+                section_image, section_caption = self.get_section_images(page_id, section_id, d)
+                if section_image is not None:
+                    neighbor_texts.append(section_caption)
+                    position_texts.append(len(position_texts))
+                    location_texts.append(location)
+                    location += 1
+                    # Graph: input_text <-> caption
+                    edge_list.append((graph_index[section_id], location))
+                    # Graph: image <-> caption
+                    # edge_list.append((previous_image_id, location))
+
+            #(3) rest section information
+            if self.context != "section_all":
+                previous_section_id = 1 # page
+                for context_id in range(len(d['section_title'])):
+                    if context_id == section_id:
+                        continue
+                    if len(neighbor_texts) < self.max_text_neighbors + 1:
+                        context_info = self.get_section_info(context_id, d, remove_summary=False)
+                        neighbor_texts.append(context_info)
+                        position_texts.append(len(position_texts))
+                        location_texts.append(location)
+                        location += 1
+                        # Graph: previous section - current section (order)
+                        edge_list.append((previous_section_id, location))
+                        graph_index[context_id] = location
+                        previous_section_id = location
+
+                    if self.context != "text_only":
+                        if len(neighbor_images) < self.max_image_neighbors:
+                            context_image, context_caption = self.get_section_images(page_id, context_id, d)
+                            if context_image is not None:
+                                if len(neighbor_texts) < self.max_text_neighbors + 1:
+                                    neighbor_texts.append(context_caption)
+                                    position_texts.append(len(position_texts))
+                                    location_texts.append(location)
+                                    location += 1
+                                    # Graph: section <-> caption
+                                    edge_list.append((previous_section_id, location))
+
+            # Graph: hierachical relations
+            for context_id in range(len(d['section_parent_index'])):
+                parent_id = d['section_parent_index'][context_id]
+                if context_id in graph_index.keys() and parent_id in graph_index.keys():
+                    edge_list.append((graph_index[context_id], graph_index[parent_id]))
+
+            # PyG graph data
+            # node_num = 1 + self.max_text_neighbors + self.max_image_neighbors
+            node_num = 1 + self.max_text_neighbors
+            edge_index = torch.LongTensor(edge_list).t().contiguous()
+            if self.position_type == 'laplacian':
+                node_value = torch.zeros((node_num))
+                graph = Data(x=node_value, edge_index=edge_index)
+                lpe = utils.compute_LPE(graph)
+                
+            edge_value = torch.ones((edge_index.shape[1]))
+            graph = torch.sparse_coo_tensor(edge_index, edge_value, [node_num, node_num]).to_dense()
+            graph = utils.normalize_graph(graph)
+            
+            graph = (graph > 0).to(torch.long)
+            
+            # Increase position ids by 1 for padding_id
+            position_texts = [position_id + 1 for position_id in position_texts]
+            # Pad
+            while len(neighbor_texts) < self.max_text_neighbors + 1:
+                neighbor_texts.append('')
+                position_texts.append(0)
+                location_texts.append(location)
+                location += 1
+
+            #Tokenize
+            neighbor_max_length = 77 if "clip" in self.text_model else 512
+            neighbor_texts = self.text_tokenizer(neighbor_texts, max_length=neighbor_max_length, padding="max_length", truncation=True, return_tensors="pt")
+            result["neighbor_input_ids"] = neighbor_texts.input_ids,
+            result["neighbor_attention_mask"] = neighbor_texts.attention_mask,
+            result["graph"] = graph
+        # print(result.keys())
         return result
 
     def get_embedding_item(self, index):
@@ -404,3 +519,5 @@ def collate(items):
             "labels": torch.stack(labels, dim=0),
             "image_positions": torch.stack(image_positions, dim=0),
             }
+
+

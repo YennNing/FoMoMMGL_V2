@@ -175,12 +175,21 @@ class SelfAttentionModel(nn.Module):
 
         self.visual_model = None
         if self.context in ("section_all", "all"):
-            embedding_dim = self.input_embeddings.embedding_dim * args.n_text_tokens
+            embedding_dim = self.input_embeddings.embedding_dim
+            self.neighbor_text_model = CLIPTextModel.from_pretrained(args.text_model)
             self.text_model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, config=config)
-            self.text_embeddings = nn.Linear(self.text_model.config.hidden_size, embedding_dim)
+            self.text_embeddings = nn.Linear(self.neighbor_text_model.config.hidden_size, embedding_dim)
             if self.position_type == "none":
                 self.text_position_embeddings = nn.Embedding(args.max_output_length + 1, embedding_dim) # + 1 for padding neighbors
+            
+            if self.context == "all":
+                self.gnn = GCN(hidden_dim=embedding_dim)
 
+            
+            self.neighbor_text_model.eval()
+            for name, param in self.neighbor_text_model.named_parameters():
+                param.requires_grad = False
+            
             self.text_model.eval()
             for name, param in self.text_model.named_parameters():
                 param.requires_grad = False
@@ -221,6 +230,7 @@ class SelfAttentionModel(nn.Module):
             self.visual_model = CLIPVisionModel.from_pretrained(args.visual_model)
             self.visual_embeddings = nn.Linear(self.visual_model.config.hidden_size, embedding_dim)
             
+            
             if self.position_type == "none":
                 self.visual_position_embeddings = nn.Embedding(args.max_output_length + 1, embedding_dim) # + 1 for padding neighbors
                 
@@ -237,7 +247,7 @@ class SelfAttentionModel(nn.Module):
 
         if self.neighbor_mode != 'raw' and self.position_type == "gnn":
             embedding_dim = self.input_embeddings.embedding_dim * args.n_text_tokens
-            self.gnn = GCN(input_dim=embedding_dim, output_dim=embedding_dim, hidden_dim=self.text_model.config.hidden_size)
+            self.gnn = GCN(input_dim=embedding_dim, output_dim=embedding_dim, hidden_dim=self.neighbor_text_model.config.hidden_size)
 
         # Freeze the base LM
         if self.args.freeze_lm:
@@ -253,16 +263,35 @@ class SelfAttentionModel(nn.Module):
         input_ids = input_ids.reshape(-1, seq_len)
         attention_mask = attention_mask.reshape(-1, seq_len)
 
-        outputs = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
-        encoder_outputs = outputs.pooler_output
+        outputs = self.neighbor_text_model(input_ids=input_ids, attention_mask=attention_mask)
+        encoder_outputs = outputs.pooler_output #([24, 512])
+        # print("encoder outputs:",encoder_outputs.shape)
         text_embs = self.text_embeddings(encoder_outputs)
+        
+        # print('text_embs shape:', text_embs.shape) #torch.Size([24, 3072])
+        
+        return text_embs.reshape(batch_size, neighbor_num, -1)
+    
+    
+    # def get_text_embs(self, input_ids, attention_mask, pos_ids):
+    #     batch_size, neighbor_num, seq_len = input_ids.shape
+    #     input_ids = input_ids.reshape(-1, seq_len)
+    #     attention_mask = attention_mask.reshape(-1, seq_len)
+    #     all_zero_rows = (attention_mask.sum(dim=1) == 0)
+    #     if all_zero_rows.any():
+    #         print("Rows with all zeros:", torch.nonzero(all_zero_rows, as_tuple=True)[0])
+    #     # print(input_ids.shape)
+    #     # print(attention_mask.shape)
+    #     text_outputs = self.lm(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+    #     text_embs = text_outputs.hidden_states[-1]  # (B, seq_len, D)
+    #     text_embs = text_embs.mean(dim=1)  # (B, D)
+        
+    #     # if self.position_type == "none":
+    #     #     pos_ids = pos_ids.reshape(-1)
+    #     #     text_embs = text_embs + self.text_position_embeddings(pos_ids)
 
-        if self.position_type == "none":
-            pos_ids = pos_ids.reshape(-1)
-            text_embs = text_embs + self.text_position_embeddings(pos_ids)
-
-        text_embs = text_embs.reshape(text_embs.shape[0], self.n_text_tokens, -1)
-        return text_embs.reshape(batch_size, neighbor_num, self.n_text_tokens, -1)
+    #     text_embs = text_embs.reshape(text_embs.shape[0], self.n_text_tokens, -1)
+    #     return text_embs.reshape(batch_size, neighbor_num, self.n_text_tokens, -1)
 
 
     def get_visual_embs(self, input_ids, attention_mask, pixel_values):
@@ -311,6 +340,8 @@ class SelfAttentionModel(nn.Module):
 
         text_embs = text_embs.unsqueeze(1).repeat(1, visual_neighbor_num, 1)  # (B, visual_neighbor_num, D)
 
+        # print(text_embs.shape)
+        # print(visual_neighbor_num)
         for layer in self.layers:
             text_embs = layer["self_attn"](query=text_embs, key=text_embs, value=text_embs)[0]
             text_embs = layer["norm1"](text_embs)
@@ -332,9 +363,10 @@ class SelfAttentionModel(nn.Module):
             self.lm.eval()
         if self.text_model is not None:
             self.text_model.eval()
+            self.neighbor_text_model.eval()
         if self.visual_model is not None:
             self.visual_model.eval()
-
+        
     def forward(
         self,
         input_ids,
@@ -359,7 +391,7 @@ class SelfAttentionModel(nn.Module):
         elif self.neighbor_mode == "raw" and self.context in ("section_all", "all"):
             input_embs = self.input_embeddings(input_ids)
             visual_embs = self.get_visual_embs(input_ids, attention_mask, images) #input_ids, attention_mask, pixel_values, neighbor_input_ids, neighbor_attention_mask, pos_ids=None
-
+            
             batch_size, seq_len, hidden_dim = input_embs.shape
             if self.context == "section_all":
                 batch_idx = torch.arange(batch_size)[:, None]
@@ -367,6 +399,20 @@ class SelfAttentionModel(nn.Module):
                 if self.decoder_only:
                     labels[batch_idx, image_positions] = -100
             else:
+                # print('neighbor_input_ids')
+                # print(neighbor_input_ids)
+                # print('neighbor_attention_mask')
+                # print(neighbor_attention_mask)
+                batch_size, neighbor_num, seq_len = neighbor_input_ids.shape
+                text_embeds = self.get_text_embs(neighbor_input_ids, neighbor_attention_mask, neighbor_pos_ids) 
+                # print('gnn input', text_embeds.shape, text_embeds) # torch.Size([2, 12,768])
+                
+                gnn_embeds = self.gnn(text_embeds, graph) 
+                graph_token = gnn_embeds.mean(dim=1)   # (batch_size, hidden_dim)
+                input_embs[:, 0, :] = graph_token
+                # print('graph_token', graph_token)
+                # print(input_embs)
+                
                 for batch_idx in range(batch_size):
                     for image_idx in range(images.shape[1]):
                         image_position = image_positions[batch_idx][self.n_visual_tokens * image_idx: self.n_visual_tokens * (image_idx + 1)]
@@ -375,12 +421,17 @@ class SelfAttentionModel(nn.Module):
                         input_embs[batch_idx, image_position] = visual_embs[batch_idx, image_idx]
                         if self.decoder_only:
                             labels[batch_idx, image_position] = -100
-
+                            labels[batch_idx, 0] = -100  #for graph token
+              
+            # print(input_embs.shape)
+            # print(attention_mask.shape)
+            # print(labels.shape)
+                        
             return self.lm(inputs_embeds=input_embs, attention_mask=attention_mask, labels=labels)
 
         elif self.neighbor_mode == "prefix" and self.context in ("section_only", "text_only"):
             batch_size, neighbor_num, seq_len = neighbor_input_ids.shape
-            neighbor_embeds = self.get_text_embs(neighbor_input_ids, neighbor_attention_mask, neighbor_pos_ids)
+            neighbor_embeds = self.get_text_embs(neighbor_input_ids, neighbor_attention_mask, neighbor_pos_ids)  #(BS, neighbor_num, token_num, embedding)
             neighbor_embeds = neighbor_embeds.reshape(batch_size, neighbor_num * self.n_text_tokens, -1)
             neighbor_attention_mask = neighbor_pos_ids > 0
             neighbor_attention_mask = torch.repeat_interleave(neighbor_attention_mask, repeats=self.n_text_tokens, dim=1)

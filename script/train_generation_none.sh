@@ -13,7 +13,7 @@ TASK='section_all'
 CONTEXT='section_all'
 DESCRIPTION=${MODEL_NAME}-${TASK}-${CONTEXT}
 
-CUDA_VISIBLE_DEVICES=3,5 python language_modelling/run_generation.py \
+CUDA_VISIBLE_DEVICES=4,6 python language_modelling/run_generation.py \
     --dataset wikiweb2m \
     --neighbor_mode raw \
     --model_name_or_path ${MODEL_NAME} \
