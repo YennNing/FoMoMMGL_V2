@@ -292,7 +292,7 @@ def main():
 def main_worker(gpu, world_size, args, log_dir, run):
     global best_acc1
     print("Use GPU: {} for training".format(gpu))
-    dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:1345', world_size=world_size, rank=gpu)
+    dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:1346', world_size=world_size, rank=gpu)
 
     # Prepare pretrained model
     if "t5" in args.model_name_or_path:
