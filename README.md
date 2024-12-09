@@ -1,1 +1,1 @@
-This is the initial version of the MMGL implementation, including all graph position encodings. An update will be available soon.
+This is the implementation of FoMoMMGL, which addes Graph Token Translator module, combined with Structured MM Fusion module, and ran experiments on WikiWeb2M dataset.
