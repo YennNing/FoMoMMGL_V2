@@ -1,6 +1,6 @@
 # FoMoMMGL Implementation
 
-This is the implementation of **FoMoMMGL**, which adds the Graph Token module, combined with the **Structured MM Fusion Attention module, and ran experiments on the **WikiWeb2M** dataset. You can find the dataset at the following URL:
+This is the implementation of **FoMoMMGL**, which adds the Graph Token module, combined with the Structured MM Fusion Attention module, and ran experiments on the **WikiWeb2M** dataset. You can find the dataset at the following URL:
 
 [https://github.com/google-research-datasets/wit/blob/main/wikiweb2m.md](https://github.com/google-research-datasets/wit/blob/main/wikiweb2m.md)
 
