@@ -13,7 +13,7 @@ We would like to express our gratitude to the **MMGL** work for providing the co
 To run the code, you need to preprocess the data following the steps outlined in the MMGL work. After downloading and preparing the dataset, you can execute the following bash script:
 
 ```bash
-sh research-MMHG/script/train_generation.sh
+sh script/train_generation.sh
 ```
 
 ## Future Work
